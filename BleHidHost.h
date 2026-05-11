@@ -96,6 +96,12 @@ public:
   }
   static int  peerCount();   // number of currently-connected peers
 
+  // Walk the bonded-peer slot table, calling `printFn` once per slot
+  // with a human-readable status line. Used by the `BLE` shell command
+  // in BASIC for diagnostics ("which keyboards are paired right now?").
+  typedef void (*DescribeFn)(const char* line);
+  static void describePeers(DescribeFn printFn);
+
 private:
   static NimBLEUUID _hidServiceUUID;   // 0x1812
   static NimBLEUUID _reportCharUUID;   // 0x2A4D
@@ -109,6 +115,7 @@ private:
     volatile bool ready      = false;
     volatile bool doConnect  = false;
     String        savedAddress;
+    String        savedName;       // friendly name captured at pairing
   };
   static Peer _peers[MAX_PEERS];
 
@@ -239,9 +246,12 @@ inline void BleHidHost::_persistPeer(int slot)
   char key[16];
   snprintf(key, sizeof(key), "peer_addr_%d", slot);
   _prefs.putString(key, _peers[slot].savedAddress);
+  snprintf(key, sizeof(key), "peer_name_%d", slot);
+  _prefs.putString(key, _peers[slot].savedName);
   _prefs.end();
-  Serial.printf("BleHidHost: slot %d saved %s\n",
-                slot, _peers[slot].savedAddress.c_str());
+  Serial.printf("BleHidHost: slot %d saved %s '%s'\n",
+                slot, _peers[slot].savedAddress.c_str(),
+                _peers[slot].savedName.c_str());
 }
 
 inline void BleHidHost::_loadAllPeers()
@@ -252,10 +262,13 @@ inline void BleHidHost::_loadAllPeers()
     char key[16];
     snprintf(key, sizeof(key), "peer_addr_%d", i);
     _peers[i].savedAddress = _prefs.getString(key, "");
+    snprintf(key, sizeof(key), "peer_name_%d", i);
+    _peers[i].savedName    = _prefs.getString(key, "");
     if (_peers[i].savedAddress.length() > 0)
     {
-      Serial.printf("BleHidHost: peer %d = %s\n",
-                    i, _peers[i].savedAddress.c_str());
+      Serial.printf("BleHidHost: peer %d = %s '%s'\n",
+                    i, _peers[i].savedAddress.c_str(),
+                    _peers[i].savedName.c_str());
     }
   }
   _prefs.end();
@@ -473,6 +486,10 @@ class BleHidHost::ScanCallbacks : public NimBLEScanCallbacks
     _peers[slot].targetAddr = ad->getAddress();
     _peers[slot].haveTarget = true;
     _peers[slot].doConnect = true;
+    // Capture friendly name from the advertisement so `BLE` can show
+    // something more useful than just a MAC address. Empty if the
+    // device didn't advertise a name.
+    _peers[slot].savedName = ad->getName().c_str();
   }
 
   void onScanEnd(const NimBLEScanResults& results, int reason) override
@@ -597,6 +614,38 @@ inline int BleHidHost::peerCount()
     if (_peers[i].connected) n++;
   }
   return n;
+}
+
+inline void BleHidHost::describePeers(DescribeFn printFn)
+{
+  if (!printFn) return;
+  char line[96];
+  printFn("BLE peers:");
+  bool any = false;
+  for (int i = 0; i < MAX_PEERS; i++)
+  {
+    if (_peers[i].savedAddress.length() == 0 && !_peers[i].connected)
+    {
+      continue;
+    }
+    any = true;
+    const char* state = _peers[i].connected
+                          ? (_peers[i].ready ? "CONNECTED" : "CONNECTING")
+                          : "BONDED";
+    const char* mac = _peers[i].savedAddress.length()
+                        ? _peers[i].savedAddress.c_str()
+                        : "(no NVS bond)";
+    const char* name = _peers[i].savedName.length()
+                         ? _peers[i].savedName.c_str()
+                         : "(no name)";
+    snprintf(line, sizeof(line), "  slot %d: %-20s %-18s %s",
+             i, name, mac, state);
+    printFn(line);
+  }
+  if (!any) printFn("  (none)");
+  snprintf(line, sizeof(line), "Pairing mode: %s",
+           _pairingMode ? "OPEN" : "closed");
+  printFn(line);
 }
 
 // ---------------------------------------------------------------------------
