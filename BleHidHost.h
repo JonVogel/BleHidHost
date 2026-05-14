@@ -95,6 +95,20 @@ public:
     return remain > 0 ? (unsigned long)remain : 0;
   }
   static int  peerCount();   // number of currently-connected peers
+  // True if at least one bonded peer exists in NVS, regardless of
+  // whether it's currently connected. The application uses this to
+  // distinguish "no keyboard ever paired" (idle, no scan) from "known
+  // keyboard absent" (auto-reconnect scan).
+  static bool hasBondedPeers();
+  // Stop any active scan and exit pairing mode. Used by the application
+  // when it wants to take the radio idle (e.g., after the title screen
+  // when no keyboard ever connected, to avoid burning CPU on a scan
+  // nobody is going to fulfill).
+  static void stopScan();
+  // Open a low-duty-cycle background scan for an auto-reconnect window.
+  // Unlike requestPairingMode/requestSilentScan (which run 100/100), this
+  // uses gentler parameters so the main loop stays responsive.
+  static void requestBackgroundScan(uint32_t windowMs = 30000);
 
   // Walk the bonded-peer slot table, calling `printFn` once per slot
   // with a human-readable status line. Used by the `BLE` shell command
@@ -648,6 +662,52 @@ inline void BleHidHost::describePeers(DescribeFn printFn)
   printFn(line);
 }
 
+inline bool BleHidHost::hasBondedPeers()
+{
+  for (int i = 0; i < MAX_PEERS; i++)
+  {
+    if (_peers[i].savedAddress.length() > 0) return true;
+  }
+  return false;
+}
+
+inline void BleHidHost::stopScan()
+{
+  // Take the radio idle. Used when the application decides nobody is
+  // expected to connect (e.g., after the title screen with no bonded
+  // peers). Clears every state flag so a pending requestSilentScan() /
+  // requestPairingMode() that hadn't been consumed by task() yet can't
+  // re-arm scanning on the next tick.
+  _pairingMode = false;
+  _userInitiatedPairing = false;
+  _pairingRequested = false;
+  _userInitiatedRequested = false;
+  NimBLEScan* pScan = NimBLEDevice::getScan();
+  if (pScan) pScan->stop();
+}
+
+inline void BleHidHost::requestBackgroundScan(uint32_t windowMs)
+{
+  // Low-duty-cycle scan to reacquire a bonded peer without hammering
+  // the radio. 50 ms window / 500 ms interval = 10% duty cycle — enough
+  // to spot the keyboard's wake-up advertising within a few seconds
+  // while leaving 90% of the radio's time available for everything else.
+  Serial.printf("BleHidHost: background reconnect scan (%lus)\n",
+                (unsigned long)(windowMs / 1000));
+  _pairingMode = true;        // reuses the pairing-mode window machinery
+  _userInitiatedPairing = false;
+  _pairingWindowMs = windowMs;
+  _pairingDeadline = millis() + windowMs;
+  _pairingStartPeerCount = peerCount();
+
+  NimBLEScan* pScan = NimBLEDevice::getScan();
+  pScan->stop();
+  pScan->clearResults();
+  pScan->setInterval(500);   // 500 ms
+  pScan->setWindow(50);      // 50 ms — 10% duty
+  pScan->start(windowMs, false);
+}
+
 // ---------------------------------------------------------------------------
 // Setup / lifecycle
 // ---------------------------------------------------------------------------
@@ -694,6 +754,10 @@ inline void BleHidHost::enterPairingMode(uint32_t windowMs)
   NimBLEScan* pScan = NimBLEDevice::getScan();
   pScan->stop();
   pScan->clearResults();
+  // Aggressive scan for active pairing — user is waiting, find devices
+  // fast. requestBackgroundScan() uses gentler params for reconnect.
+  pScan->setInterval(100);
+  pScan->setWindow(100);
   pScan->start(0, false);   // 0 = scan until stopped
 }
 
